@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from audio.recorder import Recorder
 from audio.transcriber import Transcriber
+from audio.translator import Translator
 
 class TranscriptionWindow(QtWidgets.QWidget):
     def __init__(self):
@@ -25,20 +26,24 @@ class TranscriptionWindow(QtWidgets.QWidget):
         
         # Language drop-down for selecting target translation language.
         self.language_combo = QtWidgets.QComboBox()
-        # Available languages: "en" means no translation; others will translate from English.
+        # "en" means no translation; others will show a translation pane.
         self.language_combo.addItems(["en", "fr", "es", "de", "it", "pt"])
-        self.language_combo.setCurrentText("fr")  # Default target language
+        self.language_combo.setCurrentText("en")  # Default target language is English.
+        self.language_combo.currentTextChanged.connect(self.on_language_changed)
         
-        # Two text widgets: left for English, right for translated text.
+        # Two text widgets: left for English transcription, right for translated text.
         self.english_text_edit = QtWidgets.QTextEdit()
         self.english_text_edit.setReadOnly(True)
         self.translated_text_edit = QtWidgets.QTextEdit()
         self.translated_text_edit.setReadOnly(True)
         
+        # By default, if language is "en", hide the translation pane.
+        self.translated_text_edit.hide()
+        
         # Layout for the text panes (side-by-side).
-        text_layout = QtWidgets.QHBoxLayout()
-        text_layout.addWidget(self.english_text_edit)
-        text_layout.addWidget(self.translated_text_edit)
+        self.text_layout = QtWidgets.QHBoxLayout()
+        self.text_layout.addWidget(self.english_text_edit)
+        self.text_layout.addWidget(self.translated_text_edit)
         
         # Layout for buttons and language selection.
         button_layout = QtWidgets.QHBoxLayout()
@@ -50,7 +55,7 @@ class TranscriptionWindow(QtWidgets.QWidget):
         # Overall layout.
         main_layout = QtWidgets.QVBoxLayout()
         main_layout.addLayout(button_layout)
-        main_layout.addLayout(text_layout)
+        main_layout.addLayout(self.text_layout)
         self.setLayout(main_layout)
         
         # Connect signals.
@@ -59,20 +64,31 @@ class TranscriptionWindow(QtWidgets.QWidget):
         
         # Queues for inter-thread communication.
         self.audio_queue = queue.Queue()
-        self.english_text_queue = queue.Queue()
-        self.translated_text_queue = queue.Queue()
+        self.english_text_queue = queue.Queue()     # For streaming English text.
+        self.raw_transcription_queue = queue.Queue()  # For full English segments to translate.
+        self.translated_text_queue = queue.Queue()    # For streaming translated text.
         
         # Event to signal threads to stop.
         self.stop_event = threading.Event()
         
-        # Initialize Recorder and Transcriber.
+        # Initialize Recorder, Transcriber, and Translator.
         self.recorder = Recorder(sample_rate=16000, channels=1, dtype="float32")
         self.transcriber = Transcriber(model_name="base")
+        self.translator = Translator()
         
         # Timer to update text panes.
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_text_edits)
         self.timer.start(50)  # Poll every 50 ms.
+    
+    def on_language_changed(self, lang):
+        target_lang = lang.lower()
+        if target_lang == "en":
+            # Hide the translation pane if no translation is needed.
+            self.translated_text_edit.hide()
+        else:
+            # Show the translation pane for any language other than English.
+            self.translated_text_edit.show()
     
     def start_transcription(self):
         self.start_button.setEnabled(False)
@@ -84,8 +100,11 @@ class TranscriptionWindow(QtWidgets.QWidget):
         # Start background threads.
         self.recording_thread = threading.Thread(target=self.recording_loop, daemon=True)
         self.transcription_thread = threading.Thread(target=self.transcription_loop, daemon=True)
+        self.translation_thread = threading.Thread(target=self.translation_loop, daemon=True)
+        
         self.recording_thread.start()
         self.transcription_thread.start()
+        self.translation_thread.start()
     
     def stop_transcription(self):
         self.stop_event.set()
@@ -103,8 +122,9 @@ class TranscriptionWindow(QtWidgets.QWidget):
     
     def transcription_loop(self):
         """
-        For each audio segment, obtain the English transcription and then translate it.
-        Both outputs are streamed character-by-character to separate queues.
+        For each audio segment, obtain the English transcription and stream it
+        character-by-character to the English text queue. Also, enqueue the full
+        segment for translation.
         """
         while not self.stop_event.is_set():
             try:
@@ -112,31 +132,45 @@ class TranscriptionWindow(QtWidgets.QWidget):
             except queue.Empty:
                 continue
             
-            # Transcribe to English.
-            for english_segment in self.transcriber.transcribe_stream(audio_data, language="en"):
-                # Stream English text.
+            for english_segment in self.transcriber.transcribe_stream(audio_data):
+                # Stream English text character-by-character.
                 for char in english_segment:
                     self.english_text_queue.put(char)
                     time.sleep(0.03)
                 self.english_text_queue.put("\n")
-                
-                # Get target language from the drop-down.
-                target_lang = self.language_combo.currentText().lower()
-                if target_lang != "en":
-                    # Translate the English segment.
-                    translated_segment = self.transcriber.translate_text(english_segment, target_lang)
-                else:
-                    translated_segment = english_segment
-                # Stream translated text.
-                for char in translated_segment:
-                    self.translated_text_queue.put(char)
-                    time.sleep(0.03)
-                self.translated_text_queue.put("\n")
+                # Enqueue the full segment for translation.
+                self.raw_transcription_queue.put(english_segment)
             
             self.audio_queue.task_done()
     
+    def translation_loop(self):
+        """
+        For each full English transcription segment in the raw transcription queue,
+        translate it to the target language (if not English) and stream the result
+        character-by-character to the translated text queue.
+        """
+        while not self.stop_event.is_set():
+            try:
+                english_segment = self.raw_transcription_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            
+            target_lang = self.language_combo.currentText().lower()
+            if target_lang != "en":
+                translated_segment = self.translator.translate(english_segment, target_lang)
+            else:
+                # If English is selected, do not perform translation.
+                translated_segment = ""
+            
+            for char in translated_segment:
+                self.translated_text_queue.put(char)
+                time.sleep(0.03)
+            self.translated_text_queue.put("\n")
+            
+            self.raw_transcription_queue.task_done()
+    
     def update_text_edits(self):
-        """Poll the text queues and update the corresponding text widgets."""
+        """Polls the text queues and updates the corresponding text widgets."""
         try:
             while True:
                 char = self.english_text_queue.get_nowait()
@@ -160,4 +194,3 @@ if __name__ == "__main__":
     window = TranscriptionWindow()
     window.show()
     sys.exit(app.exec_())
-
