@@ -1,7 +1,8 @@
 import sounddevice as sd
 import numpy as np
+from PyQt5.QtCore import QObject, pyqtSignal
 
-class Recorder:
+class Recorder(QObject):
     """
     Recorder encapsulates functionality to record audio from the default microphone.
     
@@ -10,11 +11,25 @@ class Recorder:
         channels (int): Number of audio channels.
         dtype (str): Data type for audio samples.
     """
+    log_signal = pyqtSignal(str)
     
+
+
     def __init__(self, sample_rate=16000, channels=1, dtype='float32'):
-        self.sample_rate = sample_rate
+        self.device = sd.query_devices(kind='input')
+        self.sample_rate = self.device['default_samplerate'] 
         self.channels = channels
         self.dtype = dtype
+
+        super().__init__()
+
+    def set_input_device(self, device=None):
+        if device:
+            self.device=device
+            self.sample_rate = self.device['default_samplerate'] 
+            print(f"Setting Device to: {device}")
+
+    
 
     def record(self, duration):
         """
@@ -31,7 +46,7 @@ class Recorder:
             # Calculate the number of samples to record
             num_samples = int(duration * self.sample_rate)
             audio = sd.rec(num_samples, samplerate=self.sample_rate, 
-                           channels=self.channels, dtype=self.dtype)
+                           channels=self.channels, dtype=self.dtype, device=self.device['index'])
             sd.wait()  # Wait until recording is finished
             # If single channel, squeeze the extra dimension
             if self.channels == 1:

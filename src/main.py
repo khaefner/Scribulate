@@ -35,7 +35,7 @@ def transcription_thread(transcriber):
 
 def main():
     # Initialize the recorder and transcriber.
-    recorder = Recorder(sample_rate=16000, channels=1, dtype='float32')
+    recorder = Recorder(sample_rate=32000, channels=1, dtype='float32')
     transcriber = Transcriber(model_name="base")
     segment_duration = 5  # seconds per recorded segment
 
